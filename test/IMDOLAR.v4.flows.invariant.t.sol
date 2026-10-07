@@ -171,8 +171,13 @@ contract V4FlowsHandler is Test {
     uint256 public ghostBurned; // what left the manager as ERC-20 minus what arrived
     uint256 public ghostWalletGross; // gross DOLAR of wallet-settled buys
     uint256 public ghostWalletNet; // what those buyers were credited
+    uint256 public ghostFeesCollected; // DOLAR protocol fees cleared from the manager
     mapping(address => uint256) public liquidity;
     uint256 public lastSupply;
+
+    /// @dev Where collected protocol fees go: the real recipient is Uniswap governance, here a
+    /// fixed account the conservation invariant knows about.
+    address public constant FEE_RECIPIENT = address(0xFEE);
 
     constructor(IMDOLAR token_, PoolManager manager_, PoolKey memory key_) {
         token = token_;
@@ -355,6 +360,39 @@ contract V4FlowsHandler is Test {
         }
     }
 
+    /// @dev Uniswap governance collects DOLAR protocol fees the pool accrued on sells. The fees
+    /// sit in the manager's ERC-20 balance until collected, so collection is a manager outflow:
+    /// the manager clears the full accrued amount and the ledger records what actually arrived.
+    /// This handler is the manager's protocol fee controller.
+    function collectProtocolFees(uint256 amount) external supplyNeverGrows {
+        uint256 accrued = manager.protocolFeesAccrued(key.currency1);
+        if (accrued == 0) return;
+        amount = bound(amount, 1, accrued);
+        uint256 before = token.balanceOf(FEE_RECIPIENT);
+        uint256 managerBefore = token.balanceOf(address(manager));
+        uint256 collected = manager.collectProtocolFees(FEE_RECIPIENT, key.currency1, amount);
+        uint256 delivered = token.balanceOf(FEE_RECIPIENT) - before;
+        assertEq(collected, amount, "the manager did not clear what was asked");
+        assertEq(manager.protocolFeesAccrued(key.currency1), accrued - amount, "accrual ledger");
+        assertEq(managerBefore - token.balanceOf(address(manager)), amount, "manager lost != fee");
+        assertLe(delivered, amount, "fee collection delivered more than was accrued");
+        ghostManagerDolar -= amount;
+        ghostBurned += amount - delivered;
+        ghostFeesCollected += amount;
+    }
+
+    /// @dev The ETH side of the same collection: not DOLAR, so it must arrive whole.
+    function collectEthProtocolFees(uint256 amount) external supplyNeverGrows {
+        uint256 accrued = manager.protocolFeesAccrued(key.currency0);
+        if (accrued == 0) return;
+        amount = bound(amount, 1, accrued);
+        uint256 before = FEE_RECIPIENT.balance;
+        uint256 managerBefore = address(manager).balance;
+        manager.collectProtocolFees(FEE_RECIPIENT, key.currency0, amount);
+        assertEq(FEE_RECIPIENT.balance - before, amount, "ETH fees arrived short");
+        assertEq(managerBefore - address(manager).balance, amount, "manager ETH mismatch");
+    }
+
     /// @dev Wallet-to-wallet moves between actors are untaxed and exact.
     function walletTransfer(uint256 seed, uint256 amount) external supplyNeverGrows {
         FlowActor from = _actor(seed);
@@ -411,6 +449,12 @@ contract IMDOLARV4FlowsInvariantTest is Test {
         // among the actors so that every flow has DOLAR to work with.
         factory.move(token, DISTRIBUTOR, SUPPLY / 10);
         manager.initialize(key, uint160(1 << 96));
+        // Uniswap governance may switch on a protocol fee at any time after launch. Turn it on
+        // here (0.1% each way, the maximum) so fee accrual and collection are part of the flows,
+        // and hand the controller role to the handler so collection is one of its random calls.
+        manager.setProtocolFeeController(address(this));
+        manager.setProtocolFee(key, uint24(1_000) | (uint24(1_000) << 12));
+        manager.setProtocolFeeController(address(handler));
         BalanceDelta seed = factory.run(FlowActor.Op.AddLiquidity, 100_000_000 ether);
         assertEq(seed.amount0(), 0, "the seed must be single sided");
         uint256 remainder = token.balanceOf(address(factory));
@@ -421,7 +465,7 @@ contract IMDOLARV4FlowsInvariantTest is Test {
         factory.move(token, address(handler.actors(0)), token.balanceOf(address(factory)));
         handler.snapshot();
 
-        bytes4[] memory selectors = new bytes4[](9);
+        bytes4[] memory selectors = new bytes4[](11);
         selectors[0] = V4FlowsHandler.walletBuy.selector;
         selectors[1] = V4FlowsHandler.walletSell.selector;
         selectors[2] = V4FlowsHandler.claimBuy.selector;
@@ -431,13 +475,17 @@ contract IMDOLARV4FlowsInvariantTest is Test {
         selectors[6] = V4FlowsHandler.addLiquidity.selector;
         selectors[7] = V4FlowsHandler.removeLiquidity.selector;
         selectors[8] = V4FlowsHandler.walletTransfer.selector;
+        selectors[9] = V4FlowsHandler.collectProtocolFees.selector;
+        selectors[10] = V4FlowsHandler.collectEthProtocolFees.selector;
         targetSelector(FuzzSelector(address(handler), selectors));
         targetContract(address(handler));
     }
 
-    /// @dev Every DOLAR is in the manager, an actor's wallet, or the untouched swarm share.
+    /// @dev Every DOLAR is in the manager, an actor's wallet, the fee recipient, or the untouched
+    /// swarm share.
     function invariant_DolarIsConserved() public view {
-        uint256 sum = token.balanceOf(address(manager)) + token.balanceOf(DISTRIBUTOR);
+        uint256 sum = token.balanceOf(address(manager)) + token.balanceOf(DISTRIBUTOR)
+            + token.balanceOf(handler.FEE_RECIPIENT());
         for (uint256 i; i < 3; ++i) {
             sum += token.balanceOf(address(handler.actors(i)));
         }
@@ -462,11 +510,27 @@ contract IMDOLARV4FlowsInvariantTest is Test {
     }
 
     /// @dev Every ERC-6909 DOLAR claim is backed by ERC-20 DOLAR the manager actually holds, and
-    /// the claims outstanding are exactly those the ledger issued.
+    /// the claims outstanding are exactly those the ledger issued. Uncollected protocol fees are
+    /// also the manager's to pay, so claims plus accrued fees must fit inside its balance too.
     function invariant_ClaimsAreBackedAndAccounted() public view {
         uint256 claims = handler.claimsOutstanding();
         assertEq(claims, handler.ghostClaims(), "claims outstanding != ledger");
         assertLe(claims, token.balanceOf(address(manager)), "claims exceed manager DOLAR");
+        assertLe(
+            claims + manager.protocolFeesAccrued(key.currency1),
+            token.balanceOf(address(manager)),
+            "claims plus accrued fees exceed manager DOLAR"
+        );
+    }
+
+    /// @dev The fee recipient holds at most 1% of every DOLAR fee cleared from the manager: fee
+    /// collection is a manager outflow and the token taxes it like a buy.
+    function invariant_FeeRecipientKeepsAtMostOnePercent() public view {
+        assertLe(
+            token.balanceOf(handler.FEE_RECIPIENT()) * 100,
+            handler.ghostFeesCollected(),
+            "the fee recipient kept more than one percent"
+        );
     }
 
     /// @dev Across every wallet-settled buy, buyers kept at most 1% of what the pool paid out.
