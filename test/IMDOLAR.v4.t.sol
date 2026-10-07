@@ -128,7 +128,8 @@ contract ClaimActor is IUnlockCallback {
     enum Action {
         ClaimBuy,
         ClaimSell,
-        Withdraw
+        Withdraw,
+        NettedRoundTrip
     }
 
     IPoolManager public immutable manager;
@@ -166,10 +167,23 @@ contract ClaimActor is IUnlockCallback {
             );
             result = uint256(uint128(d.amount0()));
             manager.take(key.currency0, address(this), result);
-        } else {
+        } else if (action == Action.Withdraw) {
             manager.burn(address(this), id, amount);
             manager.take(key.currency1, address(this), amount);
             result = amount;
+        } else {
+            // Buy, then sell the whole gross output inside the same unlock. The DOLAR delta nets
+            // to zero, so only the ETH difference is settled and the token is never called.
+            BalanceDelta bought = manager.swap(
+                key, SwapParams(true, -int256(amount), TickMath.MIN_SQRT_PRICE + 1), ""
+            );
+            result = uint256(uint128(bought.amount1()));
+            BalanceDelta sold = manager.swap(
+                key, SwapParams(false, -int256(result), TickMath.MAX_SQRT_PRICE - 1), ""
+            );
+            int256 ethDelta = int256(bought.amount0()) + int256(sold.amount0());
+            if (ethDelta < 0) manager.settle{value: uint256(-ethDelta)}();
+            else if (ethDelta > 0) manager.take(key.currency0, address(this), uint256(ethDelta));
         }
         return abi.encode(result);
     }
@@ -289,6 +303,52 @@ contract IMDOLARV4Test is Test {
         assertEq(manager.balanceOf(address(claimant), id), 0);
         assertEq(token.balanceOf(address(claimant)), rest / 100);
         assertEq(token.totalSupply(), SUPPLY - (rest - rest / 100));
+    }
+
+    /// @dev Scope limit, pinned on purpose: a buy and a sell of the full gross output inside one
+    /// unlock net the DOLAR delta to zero. No DOLAR leaves the manager, the token is never called,
+    /// and the round trip costs only the pool's LP fee. See README, "Scope limits".
+    function test_NettedRoundTripInsideOneUnlockIsOutsideTheTransferTax() public {
+        _seed();
+        ClaimActor claimant = new ClaimActor(manager);
+        vm.deal(address(claimant), 1 ether);
+        uint256 managerBefore = token.balanceOf(address(manager));
+
+        uint256 gross = claimant.act(key, ClaimActor.Action.NettedRoundTrip, 0.01 ether);
+        assertGt(gross, 0);
+
+        assertEq(token.balanceOf(address(claimant)), 0);
+        assertEq(manager.balanceOf(address(claimant), key.currency1.toId()), 0);
+        assertEq(token.balanceOf(address(manager)), managerBefore, "no DOLAR left the manager");
+        assertEq(token.totalSupply(), SUPPLY, "the token was never called");
+        // Two 0.3% LP fees on 0.01 ETH: the round trip is nearly free instead of losing 99%.
+        uint256 cost = 1 ether - address(claimant).balance;
+        assertLt(cost, 0.0001 ether, "round trip cost more than the LP fees");
+    }
+
+    /// @dev Scope limit, pinned on purpose: Uniswap protocol-fee collection is a manager outflow,
+    /// so the fee recipient receives 1% of the DOLAR accrued and 99% is burned, while the manager
+    /// clears the full accrued amount. See README, "Scope limits".
+    function test_ProtocolFeeCollectionIsTaxedAsAManagerOutflow() public {
+        _seed();
+        // This test contract owns the local manager; the real controller is Uniswap governance.
+        manager.setProtocolFeeController(address(this));
+        manager.setProtocolFee(key, uint24(1_000) | (uint24(1_000) << 12));
+
+        // A buy, then a sell of the net output: the sell's input is DOLAR, so DOLAR fees accrue.
+        trader.swap(key, true, -0.01 ether, address(trader), 1);
+        uint256 bought = token.balanceOf(address(trader));
+        trader.swap(key, false, -int256(bought), address(trader), 1);
+        uint256 accrued = manager.protocolFeesAccrued(key.currency1);
+        assertGt(accrued, 100, "no DOLAR protocol fee accrued");
+
+        address recipient = address(0xFEE);
+        uint256 supplyBefore = token.totalSupply();
+        uint256 collected = manager.collectProtocolFees(recipient, key.currency1, 0);
+        assertEq(collected, accrued, "the manager clears the full accrued amount");
+        assertEq(manager.protocolFeesAccrued(key.currency1), 0);
+        assertEq(token.balanceOf(recipient), accrued / 100, "recipient receives 1%");
+        assertEq(token.totalSupply(), supplyBefore - (accrued - accrued / 100), "99% burned");
     }
 
     /// @dev Scope limit, pinned on purpose: the rule is "from == poolManager", so a third party's
