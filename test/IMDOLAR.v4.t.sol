@@ -121,6 +121,60 @@ contract V4Actor is IUnlockCallback {
     }
 }
 
+/// @dev Test-only trader that settles the DOLAR side of a swap inside the manager: a buy is kept as
+/// an ERC-6909 claim, a sell is paid by burning that claim, and a withdrawal is the only step that
+/// moves DOLAR out of the manager as an ERC-20 transfer. Pins the scope limit of a transfer tax.
+contract ClaimActor is IUnlockCallback {
+    enum Action {
+        ClaimBuy,
+        ClaimSell,
+        Withdraw
+    }
+
+    IPoolManager public immutable manager;
+    address private immutable controller = msg.sender;
+    PoolKey private key;
+
+    constructor(IPoolManager manager_) {
+        manager = manager_;
+    }
+
+    receive() external payable {}
+
+    function act(PoolKey memory key_, Action action, uint256 amount) external returns (uint256) {
+        require(msg.sender == controller, "controller only");
+        key = key_;
+        return abi.decode(manager.unlock(abi.encode(action, amount)), (uint256));
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        require(msg.sender == address(manager), "manager only");
+        (Action action, uint256 amount) = abi.decode(data, (Action, uint256));
+        uint256 id = key.currency1.toId();
+        uint256 result;
+        if (action == Action.ClaimBuy) {
+            BalanceDelta d = manager.swap(
+                key, SwapParams(true, -int256(amount), TickMath.MIN_SQRT_PRICE + 1), ""
+            );
+            manager.settle{value: uint256(uint128(-d.amount0()))}();
+            result = uint256(uint128(d.amount1()));
+            manager.mint(address(this), id, result);
+        } else if (action == Action.ClaimSell) {
+            manager.burn(address(this), id, amount);
+            BalanceDelta d = manager.swap(
+                key, SwapParams(false, -int256(amount), TickMath.MAX_SQRT_PRICE - 1), ""
+            );
+            result = uint256(uint128(d.amount0()));
+            manager.take(key.currency0, address(this), result);
+        } else {
+            manager.burn(address(this), id, amount);
+            manager.take(key.currency1, address(this), amount);
+            result = amount;
+        }
+        return abi.encode(result);
+    }
+}
+
 contract IMDOLARV4Test is Test {
     PoolManager internal manager;
     V4Actor internal factory;
@@ -203,6 +257,61 @@ contract IMDOLARV4Test is Test {
         assertGt(gross, 0);
         assertEq(token.balanceOf(address(factory)) - before, gross / 100);
         assertEq(token.totalSupply(), SUPPLY - (gross - gross / 100));
+    }
+
+    /// @dev Scope limit, pinned on purpose: a buy whose DOLAR output stays inside the manager as an
+    /// ERC-6909 claim never calls the token, so a transfer-source tax cannot see it. The tax is
+    /// charged when the claim is withdrawn as an ERC-20 transfer; a claim sold back inside the
+    /// manager is never taxed. Closing this needs a taxing hook on the pool key, which the launch
+    /// pool does not carry. See README, "Scope limits that need requester sign-off".
+    function test_ClaimSettledBuyIsOutsideTheTransferTaxUntilWithdrawn() public {
+        _seed();
+        ClaimActor claimant = new ClaimActor(manager);
+        vm.deal(address(claimant), 1 ether);
+        uint256 id = key.currency1.toId();
+
+        uint256 gross = claimant.act(key, ClaimActor.Action.ClaimBuy, 0.01 ether);
+        assertGt(gross, 0);
+        assertEq(manager.balanceOf(address(claimant), id), gross, "claim is the untaxed gross");
+        assertEq(token.balanceOf(address(claimant)), 0);
+        assertEq(token.totalSupply(), SUPPLY, "the token was never called");
+
+        // Selling part of the claim back inside the manager is untaxed: still no token call.
+        uint256 sold = gross / 2;
+        uint256 ethBefore = address(claimant).balance;
+        claimant.act(key, ClaimActor.Action.ClaimSell, sold);
+        assertGt(address(claimant).balance, ethBefore);
+        assertEq(token.totalSupply(), SUPPLY);
+
+        // Withdrawing the rest as ERC-20 is a manager outflow and pays the 99% there.
+        uint256 rest = gross - sold;
+        claimant.act(key, ClaimActor.Action.Withdraw, rest);
+        assertEq(manager.balanceOf(address(claimant), id), 0);
+        assertEq(token.balanceOf(address(claimant)), rest / 100);
+        assertEq(token.totalSupply(), SUPPLY - (rest - rest / 100));
+    }
+
+    /// @dev Scope limit, pinned on purpose: the rule is "from == poolManager", so a third party's
+    /// liquidity withdrawal is taxed like a buy even with no swap in between, and the 99% is
+    /// burned. DOLAR liquidity on the launch pool is one-way for every LP, the factory's seed
+    /// position included (test_LiquidityWithdrawalAlsoPaysTax). See README, "Scope limits".
+    function test_ThirdPartyLiquidityWithdrawalIsTaxedAsAManagerOutflow() public {
+        _seed();
+        V4Actor lp = new V4Actor(manager);
+        factory.move(token, address(lp), 1_000 ether);
+        vm.deal(address(lp), 10 ether);
+
+        BalanceDelta added = lp.seed(key, -600, 600, 10 ether);
+        uint256 deposited = uint256(-int256(added.amount1()));
+        assertGt(deposited, 0);
+        assertEq(token.balanceOf(address(lp)), 1_000 ether - deposited, "deposit arrived short");
+        assertEq(token.totalSupply(), SUPPLY);
+
+        BalanceDelta removed = lp.seed(key, -600, 600, -10 ether);
+        uint256 owed = uint256(uint128(removed.amount1()));
+        assertGe(owed + 1, deposited, "the pool owes the principal back");
+        assertEq(token.balanceOf(address(lp)), 1_000 ether - deposited + owed / 100);
+        assertEq(token.totalSupply(), SUPPLY - (owed - owed / 100));
     }
 
     function test_UnfundedSellFailsWithoutChangingSupply() public {

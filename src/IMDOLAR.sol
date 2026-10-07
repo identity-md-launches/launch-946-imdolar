@@ -7,7 +7,10 @@ import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 /// @notice Mints one billion tokens once. Every outgoing PoolManager transfer burns a 99% tax.
 /// @dev A buy is defined by its source, not its caller or recipient. The rule also taxes liquidity
 /// withdrawals and other outgoing transfers from the configured manager. Other venues are outside
-/// this definition; ERC-20 transfers cannot identify arbitrary economic purchases.
+/// this definition; ERC-20 transfers cannot identify arbitrary economic purchases. A swap whose
+/// output stays inside the manager (an ERC-6909 claim, or a delta netted in the same unlock) never
+/// calls this contract and is taxed only when withdrawn as an ERC-20 transfer. Taxing the swap
+/// itself needs a v4 hook on the pool key, which this token cannot supply.
 contract IMDOLAR is ERC20 {
     uint256 public constant INITIAL_SUPPLY = 1_000_000_000 * 10 ** 18;
     uint256 public constant BUY_TAX_BPS = 9_900;
