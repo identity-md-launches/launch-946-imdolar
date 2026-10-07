@@ -1,0 +1,20 @@
+{
+  "kind": "custom_token",
+  "token": {
+    "contract": "IMDOLAR",
+    "name": "IMDOLAR",
+    "symbol": "DOLAR",
+    "decimals": 18,
+    "constructorArgs": ["$poolManager"],
+    "totalSupply": "1000000000000000000000000000"
+  },
+  "contracts": [],
+  "pool": {
+    "pairedCurrency": "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7",
+    "fee": 3000,
+    "tickSpacing": 60,
+    "initialPrice": "127997013751724836065202479"
+  },
+  "economics": {"poolBps":8000,"initialMarketCapWei":"2610000000000000000000","remainderTo":"0x419c3cee9568cfa394d7cf39d59ae49c968e7405"},
+  "notes": "IMDOLAR (DOLAR) mints 1,000,000,000 tokens with 18 decimals once to msg.sender in its constructor. The sole constructor argument is the immutable, already deployed $poolManager. No application contracts or initialization calls are required. Every positive transfer sourced from that manager, including transferFrom, burns gross - floor(gross / 100) and delivers floor(gross / 100), with no caller or recipient exemptions. The nominal buy tax is 99%, rounded upward in minor units; outflows below 100 minor units burn entirely. This rule also taxes liquidity withdrawals and other manager outflows. Transfers from other sources, including launch distributions, claims, seeding and sells, are untaxed. Other venues and trades settled entirely in internal credits are outside this transfer-based buy definition. There is no owner, later mint, tax setter or exemption mechanism. Burns reduce the supply after deployment. The pool uses a 0.3% LP fee and tick spacing 60. initialPrice is provenance only: floor(sqrt(initialMarketCapWei / totalSupply) * 2^96), expressed with DOLAR as currency0 and the paired currency as currency1. The deployer derives the actual opening price from economics and the initial supply using the deployed currency ordering."
+}
